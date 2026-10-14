@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network Test</title>
+<style>
+  :root { --bg: #10131c; --panel: #1a1f2c; --text: #e8ecf4; --dim: #8a93a8; --ok: #5fd068; --bad: #ff5f6d; --warn: #ffc24b; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 22px 0 8px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+  p { color: var(--dim); margin: 0 0 12px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border-radius: 8px; overflow: hidden; }
+  td { padding: 7px 10px; border-top: 1px solid #262c3b; vertical-align: top; overflow-wrap: anywhere; }
+  tr:first-child td { border-top: 0; }
+  td:first-child { width: 46%; font-family: ui-monospace, monospace; font-size: 13px; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); } .dim { color: var(--dim); }
+  button { font: inherit; padding: 9px 16px; border: 0; border-radius: 6px; background: #3b6cf0; color: #fff; cursor: pointer; margin: 4px 8px 0 0; }
+  button:disabled { opacity: .5; cursor: default; }
+  #summary { background: var(--panel); border-radius: 8px; padding: 12px 14px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Multiplayer network test</h1>
+  <p>Checks which connection services this network allows. Takes about 15 seconds.</p>
+  <button id="run">Run test</button><button id="copy" disabled>Copy results</button>
+  <div id="summary" hidden></div>
+  <h2>WebRTC</h2><table id="rtc"></table>
+  <h2>STUN servers</h2><table id="stun"></table>
+  <h2>Discovery: Nostr relays</h2><table id="nostr"></table>
+  <h2>Discovery: MQTT brokers</h2><table id="mqtt"></table>
+</main>
+<script>
+const STUN = [
+  "stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302",
+  "stun:stun3.l.google.com:19302", "stun:stun4.l.google.com:19302",
+  "stun:stun.l.google.com:3478", "stun:stun.cloudflare.com:3478", "stun:global.stun.twilio.com:3478",
+];
+const NOSTR = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net", "wss://relay.nostr.band", "wss://nostr.mom", "wss://relay.snort.social"];
+const MQTT = ["wss://broker.hivemq.com:8884/mqtt", "wss://test.mosquitto.org:8081/mqtt", "wss://broker.emqx.io:8084/mqtt"];
+
+const results = [];
+function row(table, name) {
+  const tr = document.getElementById(table).insertRow();
+  tr.insertCell().textContent = name;
+  const cell = tr.insertCell();
+  cell.innerHTML = '<span class="dim">testing…</span>';
+  const entry = { group: table, name, result: "testing" };
+  results.push(entry);
+  return (cls, text) => { cell.innerHTML = ""; const s = document.createElement("span"); s.className = cls; s.textContent = text; cell.append(s); entry.result = text; };
+}
+
+// Gathers ICE candidates with one server; resolves with the candidates seen before the timeout.
+function gather(iceServers, ms = 6000) {
+  return new Promise((resolve) => {
+    const pc = new RTCPeerConnection({ iceServers });
+    const cands = [];
+    const t0 = performance.now();
+    const done = () => { pc.close(); resolve(cands); };
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) return done();
+      if (e.candidate.candidate) cands.push({ type: e.candidate.type, address: e.candidate.address, port: e.candidate.port, relatedPort: e.candidate.relatedPort, protocol: e.candidate.protocol, ms: Math.round(performance.now() - t0) });
+    };
+    pc.createDataChannel("t");
+    pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(done);
+    setTimeout(done, ms);
+  });
+}
+
+const isV4 = (ip) => /^\d+\.\d+\.\d+\.\d+$/.test(ip || "");
+function mask(ip) {
+  if (!ip) return "?";
+  ip = ip.replace(/[[\]]/g, "");
+  return isV4(ip) ? ip.replace(/\.\d+\.\d+$/, ".x.x") : ip.split(":").slice(0, 2).join(":") + ":…";
+}
+
+async function testLoopback() {
+  const set = row("rtc", "Two peers in this page");
+  try {
+    const a = new RTCPeerConnection(), b = new RTCPeerConnection();
+    a.onicecandidate = (e) => e.candidate && b.addIceCandidate(e.candidate);
+    b.onicecandidate = (e) => e.candidate && a.addIceCandidate(e.candidate);
+    const ch = a.createDataChannel("t");
+    const got = new Promise((res) => { b.ondatachannel = (e) => { e.channel.onmessage = (m) => res(m.data); }; });
+    ch.onopen = () => ch.send("hello");
+    await a.setLocalDescription(await a.createOffer());
+    await b.setRemoteDescription(a.localDescription);
+    await b.setLocalDescription(await b.createAnswer());
+    await a.setRemoteDescription(b.localDescription);
+    const msg = await Promise.race([got, new Promise((r) => setTimeout(() => r(null), 5000))]);
+    a.close(); b.close();
+    msg ? set("ok", "works") : set("bad", "data channel didn't open");
+  } catch (e) { set("bad", "WebRTC unavailable: " + e.message); }
+}
+
+// One connection asking every STUN server at once: if the same local port shows up under different
+// public ports, the router maps per destination (a "symmetric" NAT) and direct connections fail.
+let natPorts = null;
+async function testNat() {
+  const cands = await gather(STUN.map((urls) => ({ urls })), 8000);
+  const byLocal = new Map();
+  for (const c of cands) if (c.type === "srflx" && isV4(c.address)) {
+    if (!byLocal.has(c.relatedPort)) byLocal.set(c.relatedPort, new Set());
+    byLocal.get(c.relatedPort).add(c.port);
+  }
+  natPorts = [...byLocal.values()];
+}
+
+const mapped = [];
+async function testStun(url) {
+  const set = row("stun", url);
+  const cands = await gather([{ urls: url }]);
+  const all = cands.filter((c) => c.type === "srflx");
+  const v4 = all.find((c) => isV4(c.address));
+  if (v4) mapped.push({ url, port: v4.port, address: v4.address });
+  const srflx = v4 || all[0];
+  if (srflx) { set("ok", `reachable in ${srflx.ms} ms, public address ${mask(srflx.address)}`); }
+  else set("bad", "no reply");
+}
+
+function testSocket(table, url, protocols) {
+  const set = row(table, url.replace("wss://", ""));
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+    let ws;
+    const finish = (cls, text) => { set(cls, text); try { ws.close(); } catch {} resolve(); };
+    const timer = setTimeout(() => finish("bad", "timed out"), 8000);
+    try { ws = new WebSocket(url, protocols); } catch (e) { clearTimeout(timer); return finish("bad", e.message); }
+    ws.onopen = () => { clearTimeout(timer); finish("ok", `connected in ${Math.round(performance.now() - t0)} ms`); };
+    ws.onerror = () => { clearTimeout(timer); finish("bad", "blocked or offline"); };
+  });
+}
+
+function summarize() {
+  const ok = (g) => results.filter((r) => r.group === g && /^(works|reachable|relay granted|connected)/.test(r.result)).length;
+  const symmetric = natPorts && natPorts.some((ports) => ports.size > 1);
+  let nat;
+  if (!natPorts || !natPorts.length) nat = '<span class="warn">unknown (no STUN reply over IPv4)</span>';
+  else if (!symmetric) nat = '<span class="ok">direct connections likely work</span> (public port stays the same across servers)';
+  else nat = '<span class="warn">strict network: direct connections likely fail, a relay would be needed</span> (public port changes per server)';
+  const el = document.getElementById("summary");
+  el.hidden = false;
+  el.innerHTML = `STUN: ${ok("stun")}/${STUN.length} reachable<br>Network type: ${nat}<br>Nostr: ${ok("nostr")}/${NOSTR.length} reachable · MQTT: ${ok("mqtt")}/${MQTT.length} reachable`;
+  results.push({ group: "summary", name: "network type", result: !natPorts?.length ? "unknown" : symmetric ? "symmetric: " + natPorts.map((p) => [...p].join("/")).join(", ") : "consistent port" });
+}
+
+document.getElementById("run").onclick = async () => {
+  const run = document.getElementById("run");
+  run.disabled = true;
+  results.length = 0; mapped.length = 0; natPorts = null;
+  for (const id of ["rtc", "stun", "nostr", "mqtt"]) document.getElementById(id).innerHTML = "";
+  await Promise.all([
+    testLoopback(),
+    testNat(),
+    ...STUN.map(testStun),
+    ...NOSTR.map((u) => testSocket("nostr", u)),
+    ...MQTT.map((u) => testSocket("mqtt", u, ["mqtt"])),
+  ]);
+  summarize();
+  run.disabled = false;
+  document.getElementById("copy").disabled = false;
+};
+
+document.getElementById("copy").onclick = async () => {
+  const text = results.map((r) => `${r.group}\t${r.name}\t${r.result}`).join("\n");
+  try { await navigator.clipboard.writeText(text); document.getElementById("copy").textContent = "Copied"; }
+  catch { prompt("Copy these results:", text); }
+};
+</script>
+</body>
+</html>
