@@ -24,6 +24,7 @@
 <main>
   <h1>Two-device connection test</h1>
   <p>Open this page on two devices (or more). They find each other automatically and try to connect directly. Leave both open for a minute.</p>
+  <p>Add <b>?relay</b> to the address to force traffic through the relay server.</p>
   <p>You are <b id="me"></b> · devices connected: <b id="count">0</b></p>
   <div id="relays">connecting to discovery relays…</div>
   <h2>Connected devices</h2>
@@ -32,6 +33,6 @@
   <button id="copy">Copy results</button>
   <div id="log" style="margin-top:10px"></div>
 </main>
-<script src="p2p-test.js"></script>
+<script type="module" src="p2p-test.js"></script>
 </body>
 </html>
