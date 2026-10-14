@@ -474,12 +474,31 @@ async function fetchParts() {
   if (!tags.length) return;
   fetchedBytes = 0;
   downloading = true;
+  // Parts are kept in Cache Storage so later visits skip the download. Part URLs change with
+  // each published build, so anything not in this page's list is stale and gets dropped.
+  let cache = null;
+  try {
+    cache = await caches.open("terraria-parts");
+    navigator.storage?.persist?.().catch(() => {});
+  } catch {}
+  const urls = tags.map((t) => new URL(t.dataset.src, location.href).href);
   let next = 0;
-  async function fetchOne(tag) {
+  async function fetchOne(tag, url) {
+    try {
+      const hit = cache && await cache.match(url);
+      if (hit) {
+        const blob = await hit.blob();
+        if (blob.size === Number(tag.dataset.size)) {
+          fetchedParts.set(tag, blob);
+          fetchedBytes += blob.size;
+          return;
+        }
+      }
+    } catch {}
     for (let attempt = 1; ; attempt++) {
       let got = 0;
       try {
-        const res = await fetch(new URL(tag.dataset.src, location.href));
+        const res = await fetch(url);
         if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
         const reader = res.body.getReader();
         const chunks = [];
@@ -490,7 +509,9 @@ async function fetchParts() {
           got += value.length;
           fetchedBytes += value.length;
         }
-        fetchedParts.set(tag, new Blob(chunks));
+        const blob = new Blob(chunks);
+        fetchedParts.set(tag, blob);
+        cache?.put(url, new Response(blob)).catch(() => {});
         return;
       } catch (e) {
         fetchedBytes -= got;
@@ -500,9 +521,13 @@ async function fetchParts() {
     }
   }
   async function worker() {
-    while (next < tags.length) await fetchOne(tags[next++]);
+    while (next < tags.length) { const i = next++; await fetchOne(tags[i], urls[i]); }
   }
   await Promise.all(Array.from({ length: 4 }, worker));
+  if (cache) {
+    const keep = new Set(urls);
+    cache.keys().then((reqs) => reqs.forEach((r) => keep.has(r.url) || cache.delete(r))).catch(() => {});
+  }
   fetchedBytes = null;
   downloading = false;
   setStatus("");
