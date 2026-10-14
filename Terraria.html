@@ -481,7 +481,11 @@ async function fetchParts() {
     cache = await caches.open("terraria-parts");
     navigator.storage?.persist?.().catch(() => {});
   } catch {}
-  const urls = tags.map((t) => new URL(t.dataset.src, location.href).href);
+  // StaticDelivr serves only text files from GitHub, so a page opened through it fetches its
+  // parts from GitHub's raw file host instead.
+  const gh = location.href.match(/^https:\/\/cdn\.staticdelivr\.com\/gh\/([^/]+\/[^/]+)\/([^/]+)\//);
+  const base = gh ? `https://raw.githubusercontent.com/${gh[1]}/${gh[2]}/` : location.href;
+  const urls = tags.map((t) => new URL(t.dataset.src, base).href);
   let next = 0;
   async function fetchOne(tag, url) {
     try {
